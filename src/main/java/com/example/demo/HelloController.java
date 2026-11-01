@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 public class HelloController {
 
-    private static final String VERSION = "Version 1";
+    private static final String VERSION = "Version 2 - Deployed Automatically!";
 
     @GetMapping(value = "/", produces = MediaType.TEXT_HTML_VALUE)
     public String home() {

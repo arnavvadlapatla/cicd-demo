@@ -1,0 +1,26 @@
+- name: Deploy cicd-demo to AKS
+  hosts: local
+  gather_facts: false
+  vars:
+    namespace: default
+  tasks:
+    - name: Fail if image variable is missing
+      ansible.builtin.fail:
+        msg: "Pass the image with -e image=<registry/name:tag>"
+      when: image is not defined
+
+    - name: Apply Deployment (with templated image tag)
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        template: "{{ playbook_dir }}/../k8s/deployment.yaml"
+
+    - name: Apply Service
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../k8s/service.yaml"
+
+    - name: Wait for rollout to finish
+      ansible.builtin.command: kubectl rollout status deployment/cicd-demo -n {{ namespace }} --timeout=180s
+      changed_when: false

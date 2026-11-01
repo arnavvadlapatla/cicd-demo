@@ -1,0 +1,128 @@
+name: CI-CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: arnav-cicd-demo-01
+  REGION: asia-south1
+  ZONE: asia-south1-a
+  CLUSTER_NAME: gke-cicd
+  REPO: cicd-repo
+  IMAGE_NAME: cicd-demo
+
+jobs:
+  build-test:
+    name: 1. Build & Test (Maven)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Compile, run tests, package
+        run: mvn -B clean package
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/app.jar
+
+  docker:
+    name: 2. Build & Push Docker Image
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
+
+      - name: Build and tag image
+        run: |
+          IMAGE=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest .
+
+      - name: Push image to Artifact Registry
+        run: docker push --all-tags $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME
+
+  deploy:
+    name: 3. Deploy to GKE (Ansible) & Verify
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.ZONE }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ansible
+        run: |
+          pip install ansible kubernetes
+          ansible-galaxy collection install kubernetes.core
+
+      - name: Deploy with Ansible
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/deploy.yml \
+            -e image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME:${{ github.sha }}
+
+      - name: Verify deployment status
+        run: |
+          kubectl get deployments
+          kubectl get pods -o wide
+          kubectl get svc cicd-demo-service
+
+      - name: Verify application availability
+        run: |
+          for i in $(seq 1 30); do
+            IP=$(kubectl get svc cicd-demo-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$IP" ] && break
+            echo "Waiting for external IP..."; sleep 10
+          done
+          echo "App URL: http://$IP"
+          curl --fail --retry 10 --retry-delay 6 --retry-all-errors http://$IP/

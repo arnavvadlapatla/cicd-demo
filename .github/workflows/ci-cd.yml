@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  PROJECT_ID: arnav-cicd-demo-01
+  PROJECT_ID: arnav-cicd-1101
   REGION: asia-south1
   ZONE: asia-south1-a
   CLUSTER_NAME: gke-cicd

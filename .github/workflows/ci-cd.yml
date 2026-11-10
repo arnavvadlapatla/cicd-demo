@@ -4,6 +4,15 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (leave empty = this commit's SHA)"
+        required: false
+        default: ""
+      skip_image_check:
+        description: "Skip the pre-deploy image check (for the rollback demo only)"
+        type: boolean
+        default: false
 
 env:
   PROJECT_ID: arnav-cicd-1101
@@ -96,6 +105,8 @@ jobs:
     name: 3. Deploy to GKE (Ansible) & Verify
     needs: docker
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.image_tag || github.sha }}
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -105,11 +116,26 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
           cluster_name: ${{ env.CLUSTER_NAME }}
           location: ${{ env.ZONE }}
+
+      - name: Pre-deploy check - image tag exists
+        if: github.event.inputs.skip_image_check != 'true'
+        run: |
+          IMAGE=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME:$TAG
+          echo "Checking that $IMAGE exists..."
+          if gcloud artifacts docker images describe "$IMAGE" > /dev/null 2>&1; then
+            echo "Image found."
+          else
+            echo "::error::Image tag '$TAG' not found in Artifact Registry. Deployment aborted; cluster untouched."
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -122,9 +148,21 @@ jobs:
           ansible-galaxy collection install kubernetes.core
 
       - name: Deploy with Ansible
+        id: deploy
         run: |
           ansible-playbook -i ansible/inventory.ini ansible/deploy.yml \
-            -e image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME:${{ github.sha }}
+            -e image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME:$TAG
+
+      - name: Post-deploy check - correct image is running
+        run: |
+          EXPECTED=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$IMAGE_NAME:$TAG
+          DEPLOYED=$(kubectl get deployment cicd-demo -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Expected: $EXPECTED"
+          echo "Deployed: $DEPLOYED"
+          if [ "$DEPLOYED" != "$EXPECTED" ]; then
+            echo "::error::Deployed image does not match the expected tag."
+            exit 1
+          fi
 
       - name: Verify deployment status
         run: |
@@ -141,3 +179,13 @@ jobs:
           done
           echo "App URL: http://$IP"
           curl --fail --retry 10 --retry-delay 6 --retry-all-errors http://$IP/
+
+      - name: Automatic rollback on failure
+        if: failure() && steps.deploy.outcome != 'skipped'
+        run: |
+          echo "::warning::Deployment failed - rolling back to the previous version."
+          kubectl get pods
+          kubectl get events --sort-by=.lastTimestamp | tail -10
+          kubectl rollout undo deployment/cicd-demo
+          kubectl rollout status deployment/cicd-demo --timeout=120s
+          kubectl get pods
